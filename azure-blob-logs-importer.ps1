@@ -28,9 +28,8 @@ catch {
 #     - Create or have a storage account, and enable analytics logs
 #     - Create Azure Log Analytics workspace
 #     - Change the following values:
-#           - $ResourceGroup
-#           - $StorageAccountName
-#           - $CustomerId
+#           - $Config
+#           - $WorkspaceId
 #           - $SharedKey
 #           - $LogType
 #
@@ -48,17 +47,12 @@ catch {
 
 #Login-AzAccount
 
-# Resource group name for the storage acccount
-$ResourceGroup = Get-AutomationVariable -Name 'ResourceGroup'
-# Storage account name
-$StorageAccountName = Get-AutomationVariable -Name 'StorageAccountName'
-
-# Container name for analytics logs
-$ContainerName = "`$logs"
+$configJson = Get-AutomationVariable -Name 'Config'
+$config = ConvertFrom-Json $configJson
 
 # Replace with your Workspace Id
 # Find in: Azure Portal > Log Analytics > {Your workspace} > Advanced Settings > Connected Sources > Windows Servers > WORKSPACE ID
-$CustomerId =  Get-AutomationVariable -Name 'CustomerId'  
+$WorkspaceId =  Get-AutomationVariable -Name 'WorkspaceId'
 
 # Replace with your Primary Key
 # Find in: Azure Portal > Log Analytics > {Your workspace} > Advanced Settings > Connected Sources > Windows Servers > PRIMARY KEY
@@ -91,7 +85,7 @@ $json = @"
 #
 # Create the function to create the authorization signature
 #
-Function Build-Signature ($customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource)
+Function Build-Signature ($WorkspaceId, $sharedKey, $date, $contentLength, $method, $contentType, $resource)
 {
     $xHeaders = "x-ms-date:" + $date
     $stringToHash = $method + "`n" + $contentLength + "`n" + $contentType + "`n" + $xHeaders + "`n" + $resource
@@ -103,14 +97,14 @@ Function Build-Signature ($customerId, $sharedKey, $date, $contentLength, $metho
     $sha256.Key = $keyBytes
     $calculatedHash = $sha256.ComputeHash($bytesToHash)
     $encodedHash = [Convert]::ToBase64String($calculatedHash)
-    $authorization = 'SharedKey {0}:{1}' -f $customerId,$encodedHash
+    $authorization = 'SharedKey {0}:{1}' -f $WorkspaceId,$encodedHash
     return $authorization
 }
 
 #
 # Create the function to create and post the request
 #
-Function Post-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
+Function Post-LogAnalyticsData($WorkspaceId, $sharedKey, $body, $logType)
 {
     $method = "POST"
     $contentType = "application/json"
@@ -118,14 +112,14 @@ Function Post-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
     $rfc1123date = [DateTime]::UtcNow.ToString("r")
     $contentLength = $body.Length
     $signature = Build-Signature `
-        -customerId $customerId `
+        -workspaceId $WorkspaceId `
         -sharedKey $sharedKey `
         -date $rfc1123date `
         -contentLength $contentLength `
         -method $method `
         -contentType $contentType `
         -resource $resource
-    $uri = "https://" + $customerId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
+    $uri = "https://" + $WorkspaceId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
 
     $headers = @{
         "Authorization" = $signature;
@@ -138,27 +132,9 @@ Function Post-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
     return $response.StatusCode
 }
 
-#
-# Create the function to create the authorization signature
-#
-Function Build-Signature ($customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource)
-{
-    $xHeaders = "x-ms-date:" + $date
-    $stringToHash = $method + "`n" + $contentLength + "`n" + $contentType + "`n" + $xHeaders + "`n" + $resource
-
-    $bytesToHash = [Text.Encoding]::UTF8.GetBytes($stringToHash)
-    $keyBytes = [Convert]::FromBase64String($sharedKey)
-
-    $sha256 = New-Object System.Security.Cryptography.HMACSHA256
-    $sha256.Key = $keyBytes
-    $calculatedHash = $sha256.ComputeHash($bytesToHash)
-    $encodedHash = [Convert]::ToBase64String($calculatedHash)
-    $authorization = 'SharedKey {0}:{1}' -f $customerId,$encodedHash
-    return $authorization
-}
 
 # Submit the data to the API endpoint
-#Post-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($json)) -logType $logType
+#Post-LogAnalyticsData -workspaceId $WorkspaceId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($json)) -logType $logType
 
 #
 # Convert ; to "%3B" between " in the csv line to prevent wrong values output after split with ;
@@ -268,33 +244,18 @@ Function ConvertLogLineToJson([String] $logLine)
     return $logJson
 }
 
-$storageAccount = Get-AzureRmStorageAccount -ResourceGroupName $ResourceGroup -Name $StorageAccountName -ErrorAction SilentlyContinue
-
-if($storageAccount -eq $null)
+Function ProcessContainer($storageContext, $containerName)
 {
-    throw "The storage account specified does not exist in this subscription."
-}
-
-$storageContext = $storageAccount.Context
-$containers = New-Object System.Collections.ArrayList
-$container = Get-AzureRmStorageContainer  -ResourceGroupName $ResourceGroup -AccountName $StorageAccountName  -Name $ContainerName -ErrorAction SilentlyContinue |
-        ForEach-Object { $containers.Add($_) } | Out-Null
-
-Write-Output("> Container count: {0}" -f $containers.Count)
-
-$blobCount = 0
-$Token = $Null
-$MaxReturn = 5000
-$SuccessPost = 0
-$FailedPost = 0
-
-# Enumerate containers
-$containers | ForEach-Object {
-    Write-Output("> Reading container {0}" -f $ContainerName )
+    $Token = $Null
+    $MaxReturn = 5000
+    $SuccessPost = 0
+    $FailedPost = 0
+    
+    Write-Output("> Reading container {0}" -f $containerName)
 
     do {
-        $Blobs = Get-AzureStorageBlob -Context $storageContext -Container $ContainerName  -MaxCount $MaxReturn -ContinuationToken $Token | where-object { $_.LastModified -gt (Get-Date).AddHours(-1)} 
-        if($Blobs -eq $Null) {
+        $Blobs = Get-AzureStorageBlob -Context $storageContext -Container $containerName  -MaxCount $MaxReturn -ContinuationToken $Token | where-object { $_.LastModified -gt (Get-Date).AddHours(-1)} 
+        if($Null -eq $Blobs) {
             break
         }
 
@@ -310,7 +271,7 @@ $containers | ForEach-Object {
         {
             Write-Output("> Downloading blob: {0}" -f $blob.Name)
             $filename = ".\log.txt"
-            Get-AzureStorageBlobContent -Context $storageContext -Container $ContainerName  -Blob $blob.Name -Destination $filename -Force > Null
+            Get-AzureStorageBlobContent -Context $storageContext -Container $containerName  -Blob $blob.Name -Destination $filename -Force > Null
             
             Write-Output("> Posting logs to log analytic worspace: {0}" -f $blob.Name)
             $Lines = Get-Content $filename
@@ -321,7 +282,7 @@ $containers | ForEach-Object {
                 $json = ConvertLogLineToJson($line)
                 
                 #Write-Output $json
-                $Response = Post-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($json)) -logType $logType
+                $Response = Post-LogAnalyticsData -workspaceId $WorkspaceId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($json)) -logType $logType
 
                 if($Response -eq "200") {
                     $SuccessPost++
@@ -332,7 +293,14 @@ $containers | ForEach-Object {
             }
         }
     }
-    While ($Token -ne $Null)
+    While ($Null -ne $Token)
 
     Write-Output "> Log lines posted to Log Analytics workspace: success = $SuccessPost, failure = $FailedPost"
+}
+
+$config | ForEach-Object {
+    $storageContext = New-AzureStorageContext -ConnectionString $_.connectionString
+    $containerName = $_.container
+
+    ProcessContainer($storageContext, $containerName)
 }
