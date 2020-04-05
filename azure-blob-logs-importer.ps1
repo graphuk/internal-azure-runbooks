@@ -302,5 +302,5 @@ $config | ForEach-Object {
     $storageContext = New-AzureStorageContext -ConnectionString $_.connectionString
     $containerName = $_.container
 
-    ProcessContainer($storageContext, $containerName)
+    ProcessContainer($storageContext.Context, $containerName)
 }
